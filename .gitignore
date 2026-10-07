@@ -1,5 +1,10 @@
-/benshu-client
+/benshuplayer
 *.log
 *.test
 *_test*
 testdata/
+mock/
+/BenshuPlayer
+.envrc
+/xpdf2pdf
+cmd/xpdf2pdf/enc_helper.go

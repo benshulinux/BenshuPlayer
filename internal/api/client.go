@@ -20,10 +20,10 @@ import (
 	"syscall"
 	"time"
 
-	"benshu-client/internal/crypto"
-	"benshu-client/internal/machineid"
-	"benshu-client/internal/protocol"
-	"benshu-client/internal/tlsfingerprint"
+	"benshuplayer/internal/crypto"
+	"benshuplayer/internal/machineid"
+	"benshuplayer/internal/protocol"
+	"benshuplayer/internal/tlsfingerprint"
 )
 
 // Client talks to one server endpoint.
@@ -603,7 +603,7 @@ func (c *Client) Course(courseID int) (*protocol.CourseDetail, error) {
 // calls this immediately after login (login → get/courses → get_screen_record),
 // carries the satoken ONLY as a Cookie (never as a header — unlike every
 // other authed endpoint), and the response is always
-// {"code":200,"msg":"操作成功","data":[]} (empty config list).
+// {"code":200,"msg":"OK","data":[]} (empty config list).
 func (c *Client) ScreenRecord() ([]map[string]any, error) {
 	req, err := http.NewRequest("GET", c.url("api/common/get_screen_record?os=Linux"), nil)
 	if err != nil {

@@ -15,7 +15,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"benshu-client/internal/crypto"
+	"benshuplayer/internal/crypto"
 )
 
 // Magic is the container magic in the first u64 of the header.

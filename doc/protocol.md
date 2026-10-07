@@ -1,6 +1,6 @@
 # Protocol reference (verified against the stock client)
 
-Technical documentation for what `benshu-client` replicates on the wire
+Technical documentation for what `benshuplayer` replicates on the wire
 and why. Usage instructions live in the root `README.md`.
 
 ## Wire-level parity with the stock client

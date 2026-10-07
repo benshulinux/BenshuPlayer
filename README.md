@@ -1,4 +1,4 @@
-# benshu-client
+# benshuplayer
 
 Clean-room, open-source Go client for the BenshuPlayer course server
 protocol. Implements the client-server protocol layer only: login, course
@@ -8,14 +8,15 @@ bypass, no binary patching.
 ## Install
 
 ```sh
-make            # builds ./benshu-client
+make            # builds ./BenshuPlayer and ./xpdf2pdf
 make install    # installs to /usr/local/bin (override with PREFIX=...)
 ```
 
 Or with plain Go:
 
 ```sh
-go build -o benshu-client ./cmd/benshu-client
+go build -o BenshuPlayer ./cmd/benshuplayer
+go build -o xpdf2pdf ./cmd/xpdf2pdf
 ```
 
 Requires Go 1.21+ and one third-party dependency
@@ -26,23 +27,24 @@ Everything else is stdlib.
 
 | Target | What it does |
 |---|---|
-| `make` / `make build` | build `./benshu-client` |
+| `make` / `make build` | build `./BenshuPlayer` and `./xpdf2pdf` |
 | `make test` | run the offline test suite |
 | `make selfcheck` | crypto self-test (no network) |
 | `make vet` / `make fmt` | static checks / formatting |
-| `make install` / `make uninstall` | install to `$(PREFIX)/bin` |
-| `make clean` | remove the built binary |
+| `make install` / `make uninstall` | install both binaries to `$(PREFIX)/bin` |
+| `make clean` | remove the built binaries |
 
 ## Commands
 
 ```
-benshu-client login   -phone <phone> -pass <pass> [-server <url>]
-benshu-client courses -student <id> [-token <satoken>] [-server <url>]
-benshu-client course  -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-benshu-client video   -course <id> -index <n> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-benshu-client xpdf    -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-token <satoken> [-sk <hex>] | -phone <phone> -pass <pass>] [-server <url>]
-benshu-client report  -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
-benshu-client selfcheck
+BenshuPlayer login   -phone <phone> -pass <pass> [-server <url>]
+BenshuPlayer courses -student <id> [-token <satoken>] [-server <url>]
+BenshuPlayer course  -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+BenshuPlayer video   -course <id> -index <n> [-url <uri>] [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+BenshuPlayer xpdf    -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-url <uri>] [-token <satoken> [-sk <hex>] | -phone <phone> -pass <pass>] [-server <url>]
+BenshuPlayer report  -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
+BenshuPlayer selfcheck
+xpdf2pdf             -file <book.xpdf> -key <32hex> [-out <book.pdf>]
 ```
 
 | Flag | Meaning |
@@ -54,6 +56,8 @@ benshu-client selfcheck
 | `-student` | student id (default: parsed from the login response) |
 | `-sk` | session key hex (32 chars) to pair with `-token` for key decryption |
 | `-index` | video index (1-based) |
+| `-url` | cache source: http(s) URL or local JSON file path (identical format) |
+| `-out` | output path (xpdf commands; default: input with `.pdf` suffix) |
 
 Proxy: standard `https_proxy` env vars work (CONNECT tunnel).
 
@@ -62,11 +66,11 @@ Proxy: standard `https_proxy` env vars work (CONNECT tunnel).
 Log in (prints the satoken and student id):
 
 ```sh
-$ benshu-client login -phone 13443586709 -pass '...'
+$ BenshuPlayer login -phone 13443586709 -pass '...'
 login response:
 {
   "id": 1180,
-  "nickName": "奔跑吧Linux社区",
+  "nickName": "Running Linux Community",
   ...
   "registerDate": "2019-06-19 09:30:00",
   "expireType": null,
@@ -75,7 +79,7 @@ login response:
   "version": "2.402",
   ...
 }
-courses: 6 门
+courses: 6
 ```
 
 Every command prints the full server-returned struct as indented JSON
@@ -86,12 +90,12 @@ are printed separately after the dump.
 List courses:
 
 ```sh
-$ benshu-client courses -student 1180 -token f08bfb44-...
+$ BenshuPlayer courses -student 9014 -token f08bfb44-...
 courses:
 [
   {
     "id": 3,
-    "courseName": "示例课程",
+    "courseName": "Sample Course",
     "videoCount": 20,
     "relatedCourse": "[...]",
     ...
@@ -103,13 +107,13 @@ Fetch a video and get its ffmpeg key (in-process login decrypts the
 envelope):
 
 ```sh
-$ benshu-client video -course 3 -index 1 -phone 13443586709 -pass '...'
+$ BenshuPlayer video -course 3 -index 1 -phone 13443586709 -pass '...'
 login ok: token=f08bfb44-... (sessionKeyHex=dcda99647288cd0ca3925a45e7078e85)
 video:
 {
   "id": 262,
   "courseId": 3,
-  "fileName": "示例课程视频.mp4",
+  "fileName": "sample-course-video.mp4",
   "fileCode": "",
   "videoIndex": 1,
   "uploadDate": "",
@@ -119,10 +123,17 @@ playerKey(plaintext):  cafd9a4acf8a8490ea07e8253c549090
 ffmpeg -decryption_key cafd9a4acf8a8490ea07e8253c549090 -i <file>.rlk -c copy out.mp4
 ```
 
-Convert a `.rlk` to MP4:
+Convert a `.rlk` to MP4 — cache first (no credentials), server on miss:
 
 ```sh
-benshu-client video -course 3 -index 1 -phone 13443586709 -pass '...' \
+# cache hit: no credentials needed
+$ BenshuPlayer video -course 3 -index 1 -url ./kv.json
+cache hit: course 3 index 1
+playerKey(plaintext):  767734721bae783367df263bbd87a350
+ffmpeg -decryption_key 767734721bae783367df263bbd87a350 -i <file>.rlk -c copy out.mp4
+
+# cache miss: server path (needs -phone -pass)
+$ BenshuPlayer video -course 3 -index 1 -phone 13443586709 -pass '...' \
   | grep -oE '^playerKey\(plaintext\):\s+\S+' | awk '{print $2}' \
   | xargs -I{} ffmpeg -decryption_key {} -i video.rlk -c copy video.mp4
 ```
@@ -131,37 +142,52 @@ Reuse a session without re-logging in (pass the session key hex printed
 at login time):
 
 ```sh
-$ benshu-client video -course 3 -index 1 -token f08bfb44-... -sk dcda99647288cd0ca3925a45e7078e85
+$ BenshuPlayer video -course 3 -index 1 -token f08bfb44-... -sk dcda99647288cd0ca3925a45e7078e85
 ```
 
-Convert a `.xpdf` ebook to PDF (course id comes from the file header; the
-course's ebookKey is fetched and decrypted with the session key):
+Convert a `.xpdf` ebook to PDF (course id comes from the file header;
+key resolution: cache first, server on miss):
 
 ```sh
-$ benshu-client xpdf -file "课件1.xpdf" -phone 13443586709 -pass '...'
+# cache hit: no credentials needed
+$ BenshuPlayer xpdf -file "book1.xpdf" -url ./kv.json
+cache hit: xpdf/course/3
+xpdf -> pdf: "book1.pdf" (1234567 bytes, course 3)
+
+# cache miss: server path
+$ BenshuPlayer xpdf -file "book1.xpdf" -phone 13443586709 -pass '...'
 login ok: token=f08bfb44-... (sessionKeyHex=dcda99647288cd0ca3925a45e7078e85)
 course:
 {
   "id": 3,
-  "courseName": "示例课程",
+  "courseName": "Sample Course",
   "ebookKey": "otbBjWojFV8TXaVGlAxhZUCJJLbwCY36wVuUx0CBwacX=...",
   ...
 }
 ebookKey(plaintext, course key): cafd9a4acf8a8490ea07e8253c549090
-xpdf -> pdf: "课件1.pdf" (1234567 bytes, course 3)
+xpdf -> pdf: "book1.pdf" (1234567 bytes, course 3)
+```
+
+Standalone decryptor binary (`make build` produces both `BenshuPlayer`
+and `xpdf2pdf`). `xpdf2pdf` is network-free: `.xpdf` + 32-hex course key
+→ PDF, for offline conversion with a key you already hold:
+
+```sh
+$ xpdf2pdf -file "book1.xpdf" -key cafd9a4acf8a8490ea07e8253c549090
+xpdf -> pdf: "book1.pdf" (1234567 bytes, course 3)
 ```
 
 Report playback progress:
 
 ```sh
-$ benshu-client report -course 3 -index 1 -sec 60 -student 1180 -token f08bfb44-...
-report_watch: 保存成功
+$ BenshuPlayer report -course 3 -index 1 -sec 60 -student 1180 -token f08bfb44-...
+report_watch: ok
 ```
 
 Offline self-check (no network):
 
 ```sh
-$ benshu-client selfcheck
+$ BenshuPlayer selfcheck
 ```
 
 ## Notes

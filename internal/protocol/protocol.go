@@ -3,7 +3,7 @@
 // AES field decryption used on sensitive response fields.
 //
 // The protocol itself is reverse-engineered and documented at
-// /home/ubuntu/benshu/协议规范.md; this package is a clean-room Go
+// /home/ubuntu/benshu/protocol-spec.md; this package is a clean-room Go
 // implementation of that specification.
 package protocol
 
@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"benshu-client/internal/crypto"
+	"benshuplayer/internal/crypto"
 )
 
 // Transport defaults, identical to the stock client.

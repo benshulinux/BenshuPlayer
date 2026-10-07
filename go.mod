@@ -1,4 +1,4 @@
-module benshu-client
+module benshuplayer
 
 go 1.26.8
 

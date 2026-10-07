@@ -1,4 +1,4 @@
-// Command benshu-client is a clean-room, open-source client for the
+// Command BenshuPlayer is a clean-room, open-source client for the
 // BenshuPlayer course server protocol.
 //
 // It implements ONLY the client-server protocol layer (login, course
@@ -8,12 +8,14 @@
 //
 // Subcommands:
 //
-//	benshu-client login  -phone <phone> -pass <pass> [-server <url>]
-//	benshu-client courses -student <id> [-token <satoken>] [-server <url>]
-//	benshu-client course -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-//	benshu-client video  -course <id> -index <n> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-//	benshu-client report -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
-//	benshu-client selfcheck          (offline crypto self-test)
+//	BenshuPlayer login  -phone <phone> -pass <pass> [-server <url>]
+//	BenshuPlayer courses -student <id> [-token <satoken>] [-server <url>]
+//	BenshuPlayer course -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+//	BenshuPlayer video  -course <id> -index <n> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+//	BenshuPlayer report -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
+//	BenshuPlayer video  -course <id> -index <n> [-url <uri>]   (cache lookup, no credentials; server on miss with -phone -pass)
+//	BenshuPlayer xpdf  -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-url <uri>]   (cache first, server on miss)
+//	BenshuPlayer selfcheck          (offline crypto self-test)
 //
 // When `video`/`course` run with -phone/-pass they log in in-process and
 // print the DECRYPTED playerKey (the 32-hex CENC content key that ffmpeg
@@ -30,27 +32,31 @@ import (
 	"path/filepath"
 	"strings"
 
-	"benshu-client/internal/api"
-	"benshu-client/internal/crypto"
-	"benshu-client/internal/machineid"
-	"benshu-client/internal/protocol"
-	"benshu-client/internal/xpdf"
+	"benshuplayer/internal/api"
+	"benshuplayer/internal/crypto"
+	"benshuplayer/internal/gistcache"
+	"benshuplayer/internal/machineid"
+	"benshuplayer/internal/protocol"
+	"benshuplayer/internal/xpdf"
 )
 
-const usage = `benshu-client — clean-room BenshuPlayer protocol client
+const usage = `benshuplayer — clean-room BenshuPlayer protocol client
 
 Usage:
-  benshu-client login   -phone <phone> -pass <pass> [-server <url>]
-  benshu-client courses -student <id> [-token <satoken>] [-server <url>]
-  benshu-client course  -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-  benshu-client video   -course <id> -index <n> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-  benshu-client xpdf    -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-token <satoken> [-sk <hex>] | -phone <phone> -pass <pass>] [-server <url>]
-  benshu-client report  -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
-  benshu-client selfcheck
+  BenshuPlayer login   -phone <phone> -pass <pass> [-server <url>]
+  BenshuPlayer courses -student <id> [-token <satoken>] [-server <url>]
+  BenshuPlayer course  -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+  BenshuPlayer video   -course <id> -index <n> [-url <uri>]      # cache lookup, no credentials; server on miss with -phone -pass
+                       [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+  BenshuPlayer xpdf    -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-url <uri>]
+                       [-token <satoken> [-sk <hex>] | -phone <phone> -pass <pass>] [-server <url>]
+  BenshuPlayer report  -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
+  BenshuPlayer selfcheck
 
 Flags:
   -server    server base URL (default https://benshulinux.org:8443)
   -machineid machine id (default: derived from /etc/machine-id)
+  -url       cache source: http(s) URL or local JSON file (same format; built-in default when published)
   -token     satoken from a previous login (skips login; no key decryption)
   -phone/-pass  credentials; log in in-process so playerKey/ebookKey can be decrypted
   -student   student id (default: parsed from login response)
@@ -123,12 +129,12 @@ func cmdLogin(args []string) error {
 		return err
 	}
 	dumpJSON("login response", data)
-	// 官方登录后自动行为: get/courses → get_screen_record
+	// stock-client post-login behavior: get/courses, then get_screen_record
 	if courses, err := c.Courses(data.ID); err == nil {
-		fmt.Printf("courses: %d 门\n", len(courses))
+		fmt.Printf("courses: %d\n", len(courses))
 	}
 	if cfg, err := c.ScreenRecord(); err == nil {
-		fmt.Printf("screen_record 配置: %d 条\n", len(cfg))
+		fmt.Printf("screen_record config: %d entries\n", len(cfg))
 	}
 	return nil
 }
@@ -207,11 +213,26 @@ func cmdVideo(args []string) error {
 	skhex := fs.String("sk", "", "session key hex from a previous in-process login (enables decryption with -token)")
 	server := fs.String("server", protocol.DefaultServerURL, "server base URL")
 	machineid := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
+	url := fs.String("url", gistcache.DefaultURL, "cache source: http(s) URL or local JSON file path")
 	fs.Parse(args)
 
 	if *course == 0 || *index == 0 {
 		return fmt.Errorf("-course and -index are required")
 	}
+
+	// Path 1: gist cache lookup by (course, index) — no credentials.
+	keys, gerr := gistcache.Lookup(*url, fmt.Sprintf("rlk/%d/%d", *course, *index))
+	if gerr == nil && keys != nil {
+		printRlkKeys(fmt.Sprintf("cache hit: course %d index %d", *course, *index), keys)
+		return nil
+	}
+	if *phone == "" {
+		if gerr == nil {
+			return fmt.Errorf("cache miss — server path needs -phone -pass")
+		}
+		fmt.Printf("cache lookup failed (%v) — falling back to server\n", gerr)
+	}
+
 	c, err := newClient(*server, *machineid)
 	if err != nil {
 		return err
@@ -257,9 +278,23 @@ func cmdVideo(args []string) error {
 	return nil
 }
 
+// printRlkKeys prints cache candidates and the ffmpeg usage line.
+func printRlkKeys(tag string, keys []string) {
+	fmt.Printf("%s\n", tag)
+	for i, k := range keys {
+		if len(keys) > 1 {
+			fmt.Printf("playerKey(plaintext):  %s  (candidate %d/%d — try each, verify frames)\n", k, i+1, len(keys))
+		} else {
+			fmt.Printf("playerKey(plaintext):  %s\n", k)
+		}
+	}
+	fmt.Printf("ffmpeg -decryption_key %s -i <file>.rlk -c copy out.mp4\n", keys[0])
+}
+
 // cmdXpdf converts a .xpdf ebook to PDF. The course id comes from the
-// container header; the ebookKey for that course is fetched from
-// get/course/{id} and decrypted with the session key.
+// container header. Key resolution: gist cache (xpdf/course/<id>, no
+// credentials) first; on miss, get/course/{id} on the server with an
+// in-process login.
 func cmdXpdf(args []string) error {
 	fs := flag.NewFlagSet("xpdf", flag.ExitOnError)
 	file := fs.String("file", "", "input .xpdf file")
@@ -271,6 +306,7 @@ func cmdXpdf(args []string) error {
 	skhex := fs.String("sk", "", "session key hex from a previous in-process login (enables decryption with -token)")
 	server := fs.String("server", protocol.DefaultServerURL, "server base URL")
 	machineid := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
+	url := fs.String("url", gistcache.DefaultURL, "cache source: http(s) URL or local JSON file path")
 	fs.Parse(args)
 
 	if *file == "" {
@@ -287,6 +323,20 @@ func cmdXpdf(args []string) error {
 	if *course != 0 {
 		h.CourseID = uint64(*course)
 	}
+
+	// Path 1: gist cache lookup by course id (no credentials needed).
+	keys, gerr := gistcache.Lookup(*url, fmt.Sprintf("xpdf/course/%d", h.CourseID))
+	if gerr == nil && keys != nil && len(keys) > 0 {
+		fmt.Printf("cache hit: xpdf/course/%d\n", h.CourseID)
+		return writePDF(*file, *out, keys[0], raw, h)
+	}
+	if *phone == "" {
+		if gerr == nil {
+			return fmt.Errorf("cache miss and no -phone/-pass — server path needs credentials")
+		}
+		fmt.Printf("cache lookup failed (%v) — falling back to server\n", gerr)
+	}
+
 	c, err := newClient(*server, *machineid)
 	if err != nil {
 		return err
@@ -323,14 +373,18 @@ func cmdXpdf(args []string) error {
 		return fmt.Errorf("decrypted ebookKey has unexpected length %d (want 32 hex chars)", len(ckey))
 	}
 	fmt.Printf("ebookKey(plaintext, course key): %s\n", ckey)
-	key := xpdf.FileKey(string(ckey))
+	return writePDF(*file, *out, string(ckey), raw, h)
+}
+
+// writePDF derives the per-file key and decrypts the xpdf body.
+func writePDF(inPath, outPath, courseKey string, raw []byte, h xpdf.Header) error {
+	key := xpdf.FileKey(courseKey)
 	pt, err := xpdf.DecryptBody(key, raw[xpdf.HeaderLen:], h)
 	if err != nil {
 		return err
 	}
-	outPath := *out
 	if outPath == "" {
-		outPath = strings.TrimSuffix(*file, filepath.Ext(*file)) + ".pdf"
+		outPath = strings.TrimSuffix(inPath, filepath.Ext(inPath)) + ".pdf"
 	}
 	if err := os.WriteFile(outPath, pt, 0o644); err != nil {
 		return err
@@ -361,7 +415,7 @@ func cmdReport(args []string) error {
 	if err := c.ReportWatch(*course, *student, *index, *sec); err != nil {
 		return err
 	}
-	fmt.Println("report_watch: 保存成功")
+	fmt.Println("report_watch: ok")
 	return nil
 }
 
