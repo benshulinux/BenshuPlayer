@@ -47,8 +47,10 @@ and why. Usage instructions live in the root `README.md`.
   - L2: the universal key K.
   - Output: 32-char hex CENC content key (ffmpeg `-decryption_key`).
   - The stock client therefore knows the L1 key from the moment it logs
-    in — an in-process login (`video`/`course` with `-phone/-pass`)
-    decrypts the envelopes end to end; a `-token`-only session cannot.
+    in — `BenshuPlayer login` prints the session key; passing it as
+    `-sk` alongside `-token` decrypts the envelopes end to end
+    (`video`/`course`/`xpdf` server paths); a `-token`-only session
+    cannot.
 
 ## .xpdf ebook container (verified)
 

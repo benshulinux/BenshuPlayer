@@ -43,13 +43,14 @@ import (
 const usage = `benshuplayer — clean-room BenshuPlayer protocol client
 
 Usage:
-  BenshuPlayer login   -phone <phone> -pass <pass> [-server <url>]
-  BenshuPlayer courses -student <id> [-token <satoken>] [-server <url>]
-  BenshuPlayer course  -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-  BenshuPlayer video   -course <id> -index <n> [-url <uri>]      # cache lookup, no credentials; server on miss with -phone -pass
-                       [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
+  BenshuPlayer login   -phone <phone> -pass <pass> [-server <url>]     # prints token + sessionKeyHex
+  BenshuPlayer courses -student <id> -token <satoken> [-server <url>]
+  BenshuPlayer course  -id <id> -token <satoken> [-sk <hex>] [-server <url>]
+  BenshuPlayer video   -course <id> -index <n> [-url <uri>]            # cache lookup, no credentials
+                       [-token <satoken> [-sk <hex>]] [-server <url>]
   BenshuPlayer xpdf    -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-url <uri>]
-                       [-token <satoken> [-sk <hex>] | -phone <phone> -pass <pass>] [-server <url>]
+                       [-token <satoken> [-sk <hex>]] [-server <url>]
+  BenshuPlayer locate  -file <video.rlk> [-url <uri>]                  # filename -> candidate rlk/{course}/{index} rows
   BenshuPlayer report  -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
   BenshuPlayer selfcheck
 
@@ -57,8 +58,9 @@ Flags:
   -server    server base URL (default https://benshulinux.org:8443)
   -machineid machine id (default: derived from /etc/machine-id)
   -url       cache source: http(s) URL or local JSON file (same format; built-in default when published)
-  -token     satoken from a previous login (skips login; no key decryption)
-  -phone/-pass  credentials; log in in-process so playerKey/ebookKey can be decrypted
+  -token     satoken from BenshuPlayer login (all commands except login)
+  -sk        sessionKeyHex from BenshuPlayer login — required to decrypt playerKey/ebookKey
+             envelopes on the server path (cache hits never need it)
   -student   student id (default: parsed from login response)
 `
 
@@ -82,6 +84,8 @@ func main() {
 		err = cmdXpdf(args)
 	case "report":
 		err = cmdReport(args)
+	case "locate":
+		err = cmdLocate(args)
 	case "selfcheck":
 		err = cmdSelfcheck()
 	case "help", "-h", "--help":
@@ -129,6 +133,8 @@ func cmdLogin(args []string) error {
 		return err
 	}
 	dumpJSON("login response", data)
+	fmt.Printf("token:  %s\n", data.TokenValue)
+	fmt.Printf("sessionKeyHex: %s\n", c.SessionKeyHex())
 	// stock-client post-login behavior: get/courses, then get_screen_record
 	if courses, err := c.Courses(data.ID); err == nil {
 		fmt.Printf("courses: %d\n", len(courses))
@@ -166,9 +172,8 @@ func cmdCourses(args []string) error {
 func cmdCourse(args []string) error {
 	fs := flag.NewFlagSet("course", flag.ExitOnError)
 	id := fs.Int("id", 0, "course id")
-	token := fs.String("token", "", "satoken")
-	phone := fs.String("phone", "", "phone (login in-process to decrypt ebookKey)")
-	pass := fs.String("pass", "", "password")
+	token := fs.String("token", "", "satoken from BenshuPlayer login")
+	skhex := fs.String("sk", "", "session key hex from BenshuPlayer login (enables ebookKey decryption)")
 	server := fs.String("server", protocol.DefaultServerURL, "server base URL")
 	machineid := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
 	fs.Parse(args)
@@ -176,16 +181,20 @@ func cmdCourse(args []string) error {
 	if *id == 0 {
 		return fmt.Errorf("-id is required")
 	}
+	if *token == "" {
+		return fmt.Errorf("-token is required (run `BenshuPlayer login -phone ... -pass ...` first)")
+	}
 	c, err := newClient(*server, *machineid)
 	if err != nil {
 		return err
 	}
-	if *phone != "" && *pass != "" {
-		if _, err := c.Login(*phone, *pass); err != nil {
-			return err
+	c.Token = *token
+	if *skhex != "" {
+		raw, err := hex.DecodeString(*skhex)
+		if err != nil || len(raw) != 16 {
+			return fmt.Errorf("-sk must be 32 hex chars (16 bytes)")
 		}
-	} else {
-		c.Token = *token
+		c.SessionKeyRaw = raw
 	}
 	cd, err := c.Course(*id)
 	if err != nil {
@@ -193,12 +202,42 @@ func cmdCourse(args []string) error {
 	}
 	dumpJSON("course", cd)
 	if cd.EBookKey != "" {
-		key, err := protocol.DecryptEBookKey(cd.EBookKey, c.SessionKeyHex())
-		if err != nil {
-			fmt.Println("ebookKey decrypt:", err)
+		if len(c.SessionKeyRaw) != 16 {
+			fmt.Println("ebookKey present but no -sk — rerun with -sk <sessionKeyHex from login>")
 		} else {
-			fmt.Printf("ebookKey(plaintext, course key): %s\n", key)
+			key, err := protocol.DecryptEBookKey(cd.EBookKey, c.SessionKeyHex())
+			if err != nil {
+				fmt.Println("ebookKey decrypt:", err)
+			} else {
+				fmt.Printf("ebookKey(plaintext, course key): %s\n", key)
+			}
 		}
+	}
+	return nil
+}
+
+// cmdLocate maps a local .rlk filename back to candidate
+// rlk/{course}/{index} cache rows by substring match on the server-side
+// display name (the same semantics the stock player uses).
+func cmdLocate(args []string) error {
+	fs := flag.NewFlagSet("locate", flag.ExitOnError)
+	file := fs.String("file", "", "local .rlk file path or filename")
+	url := fs.String("url", gistcache.DefaultURL, "cache source: http(s) URL or local JSON file path")
+	fs.Parse(args)
+
+	if *file == "" {
+		return fmt.Errorf("-file is required")
+	}
+	name := filepath.Base(*file)
+	matches, err := gistcache.FindByName(*url, name)
+	if err != nil {
+		return err
+	}
+	if len(matches) == 0 {
+		return fmt.Errorf("no cache row whose name contains %q", name)
+	}
+	for _, m := range matches {
+		fmt.Printf("%s  (%s)\n", m.KeyPath, m.Entry.Name)
 	}
 	return nil
 }
@@ -207,10 +246,8 @@ func cmdVideo(args []string) error {
 	fs := flag.NewFlagSet("video", flag.ExitOnError)
 	course := fs.Int("course", 0, "course id")
 	index := fs.Int("index", 0, "video index (1-based)")
-	token := fs.String("token", "", "satoken")
-	phone := fs.String("phone", "", "phone (login in-process to decrypt playerKey)")
-	pass := fs.String("pass", "", "password")
-	skhex := fs.String("sk", "", "session key hex from a previous in-process login (enables decryption with -token)")
+	token := fs.String("token", "", "satoken from BenshuPlayer login")
+	skhex := fs.String("sk", "", "session key hex from BenshuPlayer login (enables playerKey decryption)")
 	server := fs.String("server", protocol.DefaultServerURL, "server base URL")
 	machineid := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
 	url := fs.String("url", gistcache.DefaultURL, "cache source: http(s) URL or local JSON file path")
@@ -221,37 +258,30 @@ func cmdVideo(args []string) error {
 	}
 
 	// Path 1: gist cache lookup by (course, index) — no credentials.
-	keys, gerr := gistcache.Lookup(*url, fmt.Sprintf("rlk/%d/%d", *course, *index))
-	if gerr == nil && keys != nil {
-		printRlkKeys(fmt.Sprintf("cache hit: course %d index %d", *course, *index), keys)
+	e, gerr := gistcache.Lookup(*url, fmt.Sprintf("rlk/%d/%d", *course, *index))
+	if gerr == nil && e != nil && e.Key != "" {
+		fmt.Printf("cache hit: course %d index %d (%s)\n", *course, *index, e.Name)
+		printRlkKeys("", []string{e.Key})
 		return nil
 	}
-	if *phone == "" {
+	if *token == "" {
 		if gerr == nil {
-			return fmt.Errorf("cache miss — server path needs -phone -pass")
+			return fmt.Errorf("cache miss — server path needs -token (run `BenshuPlayer login -phone ... -pass ...` first)")
 		}
-		fmt.Printf("cache lookup failed (%v) — falling back to server\n", gerr)
+		return fmt.Errorf("cache lookup failed (%v) — server path needs -token", gerr)
 	}
 
 	c, err := newClient(*server, *machineid)
 	if err != nil {
 		return err
 	}
-	if *phone != "" && *pass != "" {
-		if data, err := c.Login(*phone, *pass); err != nil {
-			return err
-		} else {
-			fmt.Printf("login ok: token=%s (sessionKeyHex=%s)\n", data.TokenValue, c.SessionKeyHex())
+	c.Token = *token
+	if *skhex != "" {
+		raw, err := hex.DecodeString(*skhex)
+		if err != nil || len(raw) != 16 {
+			return fmt.Errorf("-sk must be 32 hex chars (16 bytes)")
 		}
-	} else {
-		c.Token = *token
-		if *skhex != "" {
-			raw, err := hex.DecodeString(*skhex)
-			if err != nil || len(raw) != 16 {
-				return fmt.Errorf("-sk must be 32 hex chars (16 bytes)")
-			}
-			c.SessionKeyRaw = raw
-		}
+		c.SessionKeyRaw = raw
 	}
 	v, err := c.Video(*course, *index)
 	if err != nil {
@@ -273,7 +303,7 @@ func cmdVideo(args []string) error {
 			fmt.Printf("ffmpeg -decryption_key %s -i <file>.rlk -c copy out.mp4\n", key)
 		}
 	} else {
-		fmt.Println("note: no in-process login (-phone/-pass missing); key cannot be decrypted with -token alone")
+		fmt.Println("note: no -sk given — playerKey envelope received but cannot be decrypted")
 	}
 	return nil
 }
@@ -300,10 +330,8 @@ func cmdXpdf(args []string) error {
 	file := fs.String("file", "", "input .xpdf file")
 	out := fs.String("out", "", "output .pdf path (default: input with .pdf suffix)")
 	course := fs.Int("course", 0, "course id override (default: from the .xpdf header)")
-	token := fs.String("token", "", "satoken")
-	phone := fs.String("phone", "", "phone (login in-process to decrypt ebookKey)")
-	pass := fs.String("pass", "", "password")
-	skhex := fs.String("sk", "", "session key hex from a previous in-process login (enables decryption with -token)")
+	token := fs.String("token", "", "satoken from BenshuPlayer login")
+	skhex := fs.String("sk", "", "session key hex from BenshuPlayer login (enables ebookKey decryption)")
 	server := fs.String("server", protocol.DefaultServerURL, "server base URL")
 	machineid := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
 	url := fs.String("url", gistcache.DefaultURL, "cache source: http(s) URL or local JSON file path")
@@ -325,37 +353,29 @@ func cmdXpdf(args []string) error {
 	}
 
 	// Path 1: gist cache lookup by course id (no credentials needed).
-	keys, gerr := gistcache.Lookup(*url, fmt.Sprintf("xpdf/course/%d", h.CourseID))
-	if gerr == nil && keys != nil && len(keys) > 0 {
-		fmt.Printf("cache hit: xpdf/course/%d\n", h.CourseID)
-		return writePDF(*file, *out, keys[0], raw, h)
+	e, gerr := gistcache.Lookup(*url, fmt.Sprintf("xpdf/course/%d", h.CourseID))
+	if gerr == nil && e != nil && e.Key != "" {
+		fmt.Printf("cache hit: xpdf/course/%d (%s)\n", h.CourseID, e.Name)
+		return writePDF(*file, *out, e.Key, raw, h)
 	}
-	if *phone == "" {
+	if *token == "" {
 		if gerr == nil {
-			return fmt.Errorf("cache miss and no -phone/-pass — server path needs credentials")
+			return fmt.Errorf("cache miss — server path needs -token (run `BenshuPlayer login -phone ... -pass ...` first)")
 		}
-		fmt.Printf("cache lookup failed (%v) — falling back to server\n", gerr)
+		return fmt.Errorf("cache lookup failed (%v) — server path needs -token", gerr)
 	}
 
 	c, err := newClient(*server, *machineid)
 	if err != nil {
 		return err
 	}
-	if *phone != "" && *pass != "" {
-		if data, err := c.Login(*phone, *pass); err != nil {
-			return err
-		} else {
-			fmt.Printf("login ok: token=%s (sessionKeyHex=%s)\n", data.TokenValue, c.SessionKeyHex())
+	c.Token = *token
+	if *skhex != "" {
+		raw, err := hex.DecodeString(*skhex)
+		if err != nil || len(raw) != 16 {
+			return fmt.Errorf("-sk must be 32 hex chars (16 bytes)")
 		}
-	} else {
-		c.Token = *token
-		if *skhex != "" {
-			raw, err := hex.DecodeString(*skhex)
-			if err != nil || len(raw) != 16 {
-				return fmt.Errorf("-sk must be 32 hex chars (16 bytes)")
-			}
-			c.SessionKeyRaw = raw
-		}
+		c.SessionKeyRaw = raw
 	}
 	cd, err := c.Course(int(h.CourseID))
 	if err != nil {
@@ -364,6 +384,9 @@ func cmdXpdf(args []string) error {
 	dumpJSON("course", cd)
 	if cd.EBookKey == "" {
 		return fmt.Errorf("course %d returned no ebookKey", h.CourseID)
+	}
+	if len(c.SessionKeyRaw) != 16 {
+		return fmt.Errorf("no -sk given — ebookKey envelope received but cannot be decrypted")
 	}
 	ckey, err := protocol.DecryptEBookKey(cd.EBookKey, c.SessionKeyHex())
 	if err != nil {
