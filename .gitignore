@@ -1,0 +1,5 @@
+/benshu-client
+*.log
+*.test
+*_test*
+testdata/
