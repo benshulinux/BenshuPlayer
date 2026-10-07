@@ -8,19 +8,19 @@
 //
 // Subcommands:
 //
-//	BenshuPlayer login  -phone <phone> -pass <pass> [-server <url>]
-//	BenshuPlayer courses -student <id> [-token <satoken>] [-server <url>]
-//	BenshuPlayer course -id <id> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-//	BenshuPlayer video  -course <id> -index <n> [-token <satoken> | -phone <phone> -pass <pass>] [-server <url>]
-//	BenshuPlayer report -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
-//	BenshuPlayer video  -course <id> -index <n> [-url <uri>]   (cache lookup, no credentials; server on miss with -phone -pass)
+//	BenshuPlayer login  -phone <phone> -password <pass> [-server <url>]
+//	                    (interactive prompts when flags are omitted)
+//	BenshuPlayer courses -student <id> -token <satoken> [-server <url>]
+//	BenshuPlayer course -id <id> -token <satoken> [-sk <hex>] [-server <url>]
+//	BenshuPlayer video  -course <id> -index <n> [-url <uri>]   (cache lookup, no credentials; server on miss with -token [-sk])
 //	BenshuPlayer xpdf  -file <book.xpdf> [-course <id>] [-out <book.pdf>] [-url <uri>]   (cache first, server on miss)
+//	BenshuPlayer locate -file <video.rlk> [-url <uri>]
+//	BenshuPlayer report -course <id> -index <n> -sec <s> [-student <id>] [-token <satoken>] [-server <url>]
 //	BenshuPlayer selfcheck          (offline crypto self-test)
 //
-// When `video`/`course` run with -phone/-pass they log in in-process and
-// print the DECRYPTED playerKey (the 32-hex CENC content key that ffmpeg
-// takes as -decryption_key) / course key. With -token only, the envelopes
-// are shown as ciphertext (the session key is per-login and unknown).
+// `login` is the only command taking credentials; it prints the satoken
+// and the session key. Everything else reuses the session with -token
+// (pair with -sk to decrypt key envelopes on the server path).
 package main
 
 import (
@@ -31,19 +31,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"benshuplayer/internal/api"
 	"benshuplayer/internal/crypto"
 	"benshuplayer/internal/gistcache"
 	"benshuplayer/internal/machineid"
 	"benshuplayer/internal/protocol"
+	"benshuplayer/internal/termutil"
 	"benshuplayer/internal/xpdf"
 )
 
 const usage = `benshuplayer — clean-room BenshuPlayer protocol client
 
 Usage:
-  BenshuPlayer login   -phone <phone> -pass <pass> [-server <url>]     # prints token + sessionKeyHex
+  BenshuPlayer login   -phone <phone> -password <pass> [-server <url>]     # prints token + sessionKeyHex
+                       # interactive when flags are omitted: phone:/password:/sms: prompts
   BenshuPlayer courses -student <id> -token <satoken> [-server <url>]
   BenshuPlayer course  -id <id> -token <satoken> [-sk <hex>] [-server <url>]
   BenshuPlayer video   -course <id> -index <n> [-url <uri>]            # cache lookup, no credentials
@@ -115,20 +118,67 @@ func newClient(server, machineID string) (*api.Client, error) {
 
 func cmdLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	phone := fs.String("phone", "", "phone number")
-	pass := fs.String("pass", "", "password")
+	phone := fs.String("phone", "", "phone number (prompted when omitted)")
+	pass := fs.String("password", "", "password (prompted, no echo, when omitted)")
 	server := fs.String("server", protocol.DefaultServerURL, "server base URL")
-	machineid := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
+	machineIDFlag := fs.String("machineid", "", "machine id (default: derived from /etc/machine-id)")
 	fs.Parse(args)
 
-	if *phone == "" || *pass == "" {
-		return fmt.Errorf("-phone and -pass are required")
+	// Interactive prompts for anything not given
+	// on the command line.
+	phoneVal := *phone
+	passVal := *pass
+	machineVal := *machineIDFlag
+	var err error
+	if phoneVal == "" {
+		phoneVal, err = termutil.Prompt("phone: ")
+		if err != nil || phoneVal == "" {
+			return fmt.Errorf("phone is required")
+		}
 	}
-	c, err := newClient(*server, *machineid)
+	if passVal == "" {
+		passVal, err = termutil.Password("password: ")
+		if err != nil || passVal == "" {
+			return fmt.Errorf("password is required")
+		}
+	}
+	if machineVal == "" {
+		def, derr := machineid.LinuxMachineID()
+		if derr != nil {
+			return derr
+		}
+		machineVal, err = termutil.Prompt(fmt.Sprintf("machineid: [%s] ", def))
+		if err != nil {
+			return err
+		}
+		if machineVal == "" {
+			machineVal = def
+		}
+	}
+
+	c, err := newClient(*server, machineVal)
 	if err != nil {
 		return err
 	}
-	data, err := c.Login(*phone, *pass)
+
+	// Login chain with an interactive SMS gate: pre-check password, ask
+	// the server whether SMS verification is needed, and only then log
+	// in. sms: r re-sends the code; a 6-digit input submits it.
+	if err := c.PreCheckPassword(phoneVal, passVal); err != nil {
+		return err
+	}
+	time.Sleep(c.LoginStepDelay)
+	need, err := c.CheckSMSGate(phoneVal)
+	if err != nil {
+		return err
+	}
+	if need {
+		if err := interactiveSMS(c, phoneVal); err != nil {
+			return err
+		}
+	}
+	time.Sleep(c.LoginStepDelay)
+	data, err := c.LoginFinal(phoneVal, passVal)
 	if err != nil {
 		return err
 	}
@@ -143,6 +193,47 @@ func cmdLogin(args []string) error {
 		fmt.Printf("screen_record config: %d entries\n", len(cfg))
 	}
 	return nil
+}
+
+// interactiveSMS drives the SMS verification dialog: it sends a first
+// code, then loops on "sms: " — "r" re-sends, 6 digits verify. On
+// successful verification the loop ends and the caller proceeds to the
+// final login.
+func interactiveSMS(c *api.Client, phone string) error {
+	if err := c.SendSMS(phone); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "sms code sent (30 min valid)")
+	for {
+		input, err := termutil.Prompt("sms: ")
+		if err != nil {
+			return err
+		}
+		switch {
+		case input == "r":
+			if err := c.SendSMS(phone); err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stderr, "sms code re-sent")
+		case len(input) == 6 && isDigits(input):
+			if err := c.VerifySMS(phone, input); err != nil {
+				fmt.Fprintf(os.Stderr, "verify failed (%v) — try again or enter r to re-send\n", err)
+				continue
+			}
+			return nil
+		default:
+			fmt.Fprintln(os.Stderr, "expect 6 digits, or r to re-send")
+		}
+	}
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 func cmdCourses(args []string) error {
@@ -182,7 +273,7 @@ func cmdCourse(args []string) error {
 		return fmt.Errorf("-id is required")
 	}
 	if *token == "" {
-		return fmt.Errorf("-token is required (run `BenshuPlayer login -phone ... -pass ...` first)")
+		return fmt.Errorf("-token is required (run `BenshuPlayer login -phone ... -password ...` first)")
 	}
 	c, err := newClient(*server, *machineid)
 	if err != nil {
@@ -266,7 +357,7 @@ func cmdVideo(args []string) error {
 	}
 	if *token == "" {
 		if gerr == nil {
-			return fmt.Errorf("cache miss — server path needs -token (run `BenshuPlayer login -phone ... -pass ...` first)")
+			return fmt.Errorf("cache miss — server path needs -token (run `BenshuPlayer login -phone ... -password ...` first)")
 		}
 		return fmt.Errorf("cache lookup failed (%v) — server path needs -token", gerr)
 	}
@@ -360,7 +451,7 @@ func cmdXpdf(args []string) error {
 	}
 	if *token == "" {
 		if gerr == nil {
-			return fmt.Errorf("cache miss — server path needs -token (run `BenshuPlayer login -phone ... -pass ...` first)")
+			return fmt.Errorf("cache miss — server path needs -token (run `BenshuPlayer login -phone ... -password ...` first)")
 		}
 		return fmt.Errorf("cache lookup failed (%v) — server path needs -token", gerr)
 	}

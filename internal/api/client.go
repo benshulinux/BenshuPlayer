@@ -235,6 +235,26 @@ func (c *Client) BuildLogin(phone, password string) (*protocol.LoginRequest, err
 // so byte-level login parity is what keeps the two clients
 // indistinguishable.
 func (c *Client) Login(phone, password string) (*protocol.LoginData, error) {
+	if err := c.PreCheckPassword(phone, password); err != nil {
+		return nil, err
+	}
+	time.Sleep(c.LoginStepDelay)
+	need, err := c.CheckSMSGate(phone)
+	if err != nil {
+		return nil, err
+	}
+	if need {
+		return nil, fmt.Errorf("api: sms verification required (interactive login: call SendSMS then VerifySMS, then LoginFinal)")
+	}
+	time.Sleep(c.LoginStepDelay)
+	return c.LoginFinal(phone, password)
+}
+
+// loginPost issues one request on a fresh connection with the login-chain
+// user agent handling. The server answers every login-chain response with
+// Connection: close (captured), so — like the stock client — each request
+// opens a fresh connection.
+func (c *Client) loginPost(path, userAgent string, uaLast bool, body []byte) ([]byte, error) {
 	u, err := url.Parse(c.BaseURL)
 	if err != nil {
 		return nil, err
@@ -244,47 +264,103 @@ func (c *Client) Login(phone, password string) (*protocol.LoginData, error) {
 	if c.DialOverride != nil {
 		dial = c.DialOverride
 	}
-	// The server answers every login-chain response with Connection: close
-	// (captured), so — like the stock client — each request opens a fresh
-	// connection.
-	post := func(path, userAgent string, uaLast bool, body []byte) ([]byte, error) {
-		conn, err := dial(u.Hostname(), addr)
-		if err != nil {
-			return nil, err
-		}
-		defer conn.Close()
-		// The stock client times out after 20s with no retry; mirror that
-		// on the raw path too (net.Dial alone has no deadline).
-		conn.SetDeadline(time.Now().Add(20 * time.Second))
-		return loginPost(conn, path, "application/json", userAgent, uaLast, body)
+	conn, err := dial(u.Hostname(), addr)
+	if err != nil {
+		return nil, err
 	}
+	defer conn.Close()
+	// The stock client times out after 20s with no retry; mirror that
+	// on the raw path too (net.Dial alone has no deadline).
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	return loginPost(conn, path, "application/json", userAgent, uaLast, body)
+}
 
-	marshal := qtIndentedJSON
-
-	// 1. Pre-check: password. UA = Mozilla/5.0 (last header, stock order).
-	body1 := marshal([][2]string{
+// PreCheckPassword is login-chain step 1: password pre-check.
+// UA = Mozilla/5.0 (last header, stock order).
+func (c *Client) PreCheckPassword(phone, password string) error {
+	body := qtIndentedJSON([][2]string{
 		{"machineId", c.MachineID}, {"password", password},
 		{"phoneNo", phone}, {"version", protocol.Version}})
-	if _, err := post("/api/common/check_student_phone_password", "Mozilla/5.0", true, body1); err != nil {
-		return nil, fmt.Errorf("api: pre-check password: %w", err)
+	if _, err := c.loginPost("/api/common/check_student_phone_password", "Mozilla/5.0", true, body); err != nil {
+		return fmt.Errorf("api: pre-check password: %w", err)
 	}
-	time.Sleep(c.LoginStepDelay)
-	// 2. Pre-check: SMS verify gate.
-	body2 := marshal([][2]string{
+	return nil
+}
+
+// CheckSMSGate is login-chain step 2: the SMS-verification gate. It
+// returns true when the server answers "需手机验证" (msg text comparison,
+// matching sub_345B30 in the stock client) and false for "无需手机验证".
+func (c *Client) CheckSMSGate(phone string) (bool, error) {
+	body := qtIndentedJSON([][2]string{
 		{"data", "0"}, {"machineId", c.MachineID},
 		{"phoneNo", phone}, {"version", protocol.Version}})
-	if _, err := post("/api/common/check_send_sms_verify", "Mozilla/5.0", true, body2); err != nil {
-		return nil, fmt.Errorf("api: pre-check sms: %w", err)
+	payload, err := c.loginPost("/api/common/check_send_sms_verify", "Mozilla/5.0", true, body)
+	if err != nil {
+		return false, fmt.Errorf("api: pre-check sms: %w", err)
 	}
-	time.Sleep(c.LoginStepDelay)
+	var env protocol.Envelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return false, fmt.Errorf("api: sms gate: bad envelope JSON: %w", err)
+	}
+	switch env.Msg {
+	case "需手机验证":
+		return true, nil
+	case "无需手机验证":
+		return false, nil
+	default:
+		return false, fmt.Errorf("api: sms gate: unexpected msg %q", env.Msg)
+	}
+}
 
-	// 3. Login proper with the custom OS/kernel User-Agent (stock puts the
-	// User-Agent after Content-Type here).
+// SendSMS asks the server to send an SMS verification code to phone.
+// Body mirrors check_send_sms_verify (data field carries the phone).
+func (c *Client) SendSMS(phone string) error {
+	body := qtIndentedJSON([][2]string{
+		{"data", phone}, {"machineId", c.MachineID},
+		{"phoneNo", phone}, {"version", protocol.Version}})
+	payload, err := c.loginPost("/api/common/check_sms", "Mozilla/5.0", true, body)
+	if err != nil {
+		return fmt.Errorf("api: check_sms: %w", err)
+	}
+	var env protocol.Envelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return fmt.Errorf("api: check_sms: bad envelope JSON: %w", err)
+	}
+	if env.Code != 200 && env.Code != 0 {
+		return fmt.Errorf("api: check_sms rejected: code=%d msg=%s", env.Code, env.Msg)
+	}
+	return nil
+}
+
+// VerifySMS submits the 6-digit code. Body = {"data": code} (pinned by
+// sub_346DD0 disassembly); success = HTTP 200.
+func (c *Client) VerifySMS(phone, code string) error {
+	body := qtIndentedJSON([][2]string{
+		{"data", code}, {"machineId", c.MachineID},
+		{"phoneNo", phone}, {"version", protocol.Version}})
+	payload, err := c.loginPost("/api/common/verify_sms", "Mozilla/5.0", true, body)
+	if err != nil {
+		return fmt.Errorf("api: verify_sms: %w", err)
+	}
+	var env protocol.Envelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return fmt.Errorf("api: verify_sms: bad envelope JSON: %w", err)
+	}
+	if env.Code != 200 && env.Code != 0 {
+		return fmt.Errorf("api: verify_sms rejected: code=%d msg=%s", env.Code, env.Msg)
+	}
+	return nil
+}
+
+// LoginFinal is login-chain step 3: the login proper with the custom
+// OS/kernel User-Agent (stock puts the User-Agent after Content-Type
+// here). Requires the SMS gate to have passed.
+func (c *Client) LoginFinal(phone, password string) (*protocol.LoginData, error) {
 	req, err := c.BuildLogin(phone, password)
 	if err != nil {
 		return nil, err
 	}
-	payload, err := post("/api/common/login", osUserAgent(), false, marshal([][2]string{
+	payload, err := c.loginPost("/api/common/login", osUserAgent(), false, qtIndentedJSON([][2]string{
 		{"data", req.Data}, {"machineId", req.MachineID},
 		{"password", req.Password}, {"phoneNo", req.PhoneNo}}))
 	if err != nil {
@@ -298,7 +374,7 @@ func (c *Client) Login(phone, password string) (*protocol.LoginData, error) {
 		return nil, fmt.Errorf("api: login rejected: code=%d msg=%s", env.Code, env.Msg)
 	}
 
-	// 4. Parse and validate the data object.
+	// Parse and validate the data object.
 	var data protocol.LoginData
 	if err := json.Unmarshal(env.Data, &data); err != nil {
 		return nil, fmt.Errorf("api: login data: %w", err)

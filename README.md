@@ -37,7 +37,7 @@ Everything else is stdlib.
 ## Commands
 
 ```
-BenshuPlayer login   -phone <phone> -pass <pass> [-server <url>]          # prints token + sessionKeyHex
+BenshuPlayer login   -phone <phone> -password <pass> [-server <url>]          # prints token + sessionKeyHex
 BenshuPlayer courses -student <id> -token <satoken> [-server <url>]
 BenshuPlayer course  -id <id> -token <satoken> [-sk <hex>] [-server <url>]
 BenshuPlayer video   -course <id> -index <n> [-url <uri>]                 # cache lookup, no credentials
@@ -55,7 +55,7 @@ xpdf2pdf             -file <book.xpdf> -key <32hex> [-out <book.pdf>]
 | `-server` | server base URL (default `https://benshulinux.org:8443`) |
 | `-machineid` | machine id (default: derived from `/etc/machine-id`) |
 | `-token` | `satoken` from `BenshuPlayer login` — required by every command except `login` and cache lookups |
-| `-phone` / `-pass` | credentials — accepted by `login` ONLY (the server keeps a login session; re-logging in per command trips it) |
+| `-phone` / `-password` | credentials — accepted by `login` ONLY (the server keeps a login session; re-logging in per command trips it) |
 | `-student` | student id (default: parsed from the login response) |
 | `-sk` | sessionKeyHex from `login` — pair with `-token` to decrypt key envelopes on the server path |
 | `-index` | video index (1-based) |
@@ -66,10 +66,15 @@ Proxy: standard `https_proxy` env vars work (CONNECT tunnel).
 
 ## Examples
 
-Log in once (prints the satoken and the session key hex for later use):
+Log in once (prints the satoken and the session key hex for later use).
+When `-phone` / `-password` are omitted, login becomes interactive
+(password is not echoed):
 
 ```sh
-$ BenshuPlayer login -phone 13443586709 -pass '...'
+$ BenshuPlayer login
+phone: 13443586709
+password: **************      <- typed without echo
+machineid: [736164d0de1efa466cc541970b1de6c2]   <- Enter keeps the default
 login response:
 {
   "id": 1180,
@@ -85,6 +90,21 @@ login response:
 token:  f08bfb44-62b2-482a-b67f-63ad9f252a34
 sessionKeyHex: dcda99647288cd0ca3925a45e7078e85
 courses: 6
+```
+
+When the server requires SMS verification, login pauses for a code
+(`r` re-sends, 6 digits submit):
+
+```sh
+$ BenshuPlayer login
+phone: 13443586709
+password: **************      <- typed without echo
+sms code sent (30 min valid)
+sms: r                       <- re-send the code
+sms code re-sent
+sms: 123456                  <- submit the 6-digit code
+token:  f08bfb44-62b2-482a-b67f-63ad9f252a34
+sessionKeyHex: dcda99647288cd0ca3925a45e7078e85
 ```
 
 Every command prints the full server-returned struct as indented JSON
@@ -195,7 +215,7 @@ $ BenshuPlayer selfcheck
 - **One session per account at a time**: logging in with a new session
   invalidates the previous one (the server kicks older `satoken`s). Don't
   run the player and this client against the same account simultaneously.
-  This is also why only `login` takes `-phone/-pass`: every other command
+  This is also why only `login` takes `-phone/-password`: every other command
   reuses the session via `-token`.
 - **`-token` alone cannot decrypt**: the playerKey/ebookKey envelopes are
   encrypted with a per-login session key. Pair `-token` with

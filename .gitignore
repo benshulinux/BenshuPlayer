@@ -8,3 +8,6 @@ mock/
 .envrc
 /xpdf2pdf
 cmd/xpdf2pdf/enc_helper.go
+cmd/dumpkeys
+cmd/dumpxpdf
+cmd/enumerate
